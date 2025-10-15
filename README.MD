@@ -97,6 +97,3 @@
 【统计msg】当前观看人数: 22140, 累计观看人数: 43.6万
 【进场msg】[73874992083][男]😦 进入了直播间
 ```
-
-## buy me a coffee
-<img src="alipay.jpg" width="400" height="400">

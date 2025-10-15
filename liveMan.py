@@ -29,6 +29,9 @@ from protobuf.douyin import *
 
 from urllib3.util.url import parse_url
 
+# 顶层导入与模块级 logger
+import logging
+logger = logging.getLogger(__name__)
 
 def execute_js(js_file: str):
     """
@@ -81,7 +84,7 @@ def generateSignature(wss, script_file='sign.js'):
         signature = ctx.call("get_sign", md5_param)
         return signature
     except Exception as e:
-        print(e)
+        logger.exception("【X】生成签名失败: %s", e)
     
     # 以下代码对应js脚本为sign_v0.js
     # context = execjs.compile(script)
@@ -106,7 +109,7 @@ def generateMsToken(length=182):
 
 class DouyinLiveWebFetcher:
     
-    def __init__(self, live_id, abogus_file='a_bogus.js'):
+    def __init__(self, live_id, abogus_file='a_bogus.js', writer=None, heartbeat_interval: float = 5.0, anchor_name: str = None):
         """
         直播间弹幕抓取对象
         :param live_id: 直播间的直播id，打开直播间web首页的链接如：https://live.douyin.com/261378947940，
@@ -123,6 +126,11 @@ class DouyinLiveWebFetcher:
         self.headers = {
             'User-Agent': self.user_agent
         }
+        self.writer = writer
+        self.logger = logger
+        self.heartbeat_interval = float(heartbeat_interval)
+        self.anchor_name = anchor_name
+        self.writer = writer
     
     def start(self):
         self._connectWebSocket()
@@ -145,7 +153,7 @@ class DouyinLiveWebFetcher:
             response = self.session.get(self.live_url, headers=headers)
             response.raise_for_status()
         except Exception as err:
-            print("【X】Request the live url error: ", err)
+            self.logger.error("【X】Request the live url error: %s", err)
         else:
             self.__ttwid = response.cookies.get('ttwid')
             return self.__ttwid
@@ -167,14 +175,12 @@ class DouyinLiveWebFetcher:
             response = self.session.get(url, headers=headers)
             response.raise_for_status()
         except Exception as err:
-            print("【X】Request the live room url error: ", err)
+            self.logger.error("【X】Request the live room url error: %s", err)
         else:
             match = re.search(r'roomId\\":\\"(\d+)\\"', response.text)
             if match is None or len(match.groups()) < 1:
-                print("【X】No match found for roomId")
-            
+                self.logger.error("【X】No match found for roomId")
             self.__room_id = match.group(1)
-            
             return self.__room_id
     
     def get_ac_nonce(self):
@@ -233,7 +239,7 @@ class DouyinLiveWebFetcher:
             user = data.get('user')
             user_id = user.get('id_str')
             nickname = user.get('nickname')
-            print(f"【{nickname}】[{user_id}]直播间：{['正在直播', '已结束'][bool(room_status)]}.")
+            self.logger.info("【%s】[%s]直播间：%s.", nickname, user_id, ['正在直播', '已结束'][bool(room_status)])
     
     def _connectWebSocket(self):
         """
@@ -282,18 +288,19 @@ class DouyinLiveWebFetcher:
             try:
                 heartbeat = PushFrame(payload_type='hb').SerializeToString()
                 self.ws.send(heartbeat, websocket.ABNF.OPCODE_PING)
-                print("【√】发送心跳包")
+                self.logger.debug("【√】发送心跳包")
             except Exception as e:
-                print("【X】心跳包检测错误: ", e)
+                self.logger.error("【X】心跳包检测错误: %s", e)
                 break
             else:
-                time.sleep(5)
+                time.sleep(self.heartbeat_interval)
     
     def _wsOnOpen(self, ws):
         """
         连接建立成功
         """
-        print("【√】WebSocket连接成功.")
+        self.logger.info("【√】WebSocket连接成功. 主播:%s live_id:%s room_id:%s",
+                         self.anchor_name or "未知", self.live_id, self.room_id)
         threading.Thread(target=self._sendHeartbeat).start()
     
     def _wsOnMessage(self, ws, message):
@@ -338,19 +345,34 @@ class DouyinLiveWebFetcher:
                 pass
     
     def _wsOnError(self, ws, error):
-        print("WebSocket error: ", error)
+        self.logger.error("WebSocket error: %s [主播:%s live_id:%s room_id:%s]",
+                          error, self.anchor_name or "未知", self.live_id, self.room_id)
     
     def _wsOnClose(self, ws, *args):
         self.get_room_status()
-        print("WebSocket connection closed.")
+        self.logger.info("WebSocket connection closed. 主播:%s live_id:%s room_id:%s",
+                         self.anchor_name or "未知", self.live_id, self.room_id)
     
+    def _emit_event(self, event_type: str, data: dict):
+        if not self.writer:
+            return
+        record = {
+            "live_id": self.live_id,
+            "room_id": self.room_id,
+            "event_type": event_type,
+            "data": data,
+            "ts": int(time.time() * 1000),
+        }
+        self.writer.enqueue(record)
+
     def _parseChatMsg(self, payload):
         """聊天消息"""
         message = ChatMessage().parse(payload)
         user_name = message.user.nick_name
         user_id = message.user.id
         content = message.content
-        print(f"【聊天msg】[{user_id}]{user_name}: {content}")
+        self.logger.debug("【聊天msg】[%s]%s: %s", user_id, user_name, content)
+        self._emit_event("chat", {"user_id": user_id, "user_name": user_name, "content": content})
     
     def _parseGiftMsg(self, payload):
         """礼物消息"""
@@ -358,14 +380,16 @@ class DouyinLiveWebFetcher:
         user_name = message.user.nick_name
         gift_name = message.gift.name
         gift_cnt = message.combo_count
-        print(f"【礼物msg】{user_name} 送出了 {gift_name}x{gift_cnt}")
+        self.logger.debug("【礼物msg】%s 送出了 %sx%s", user_name, gift_name, gift_cnt)
+        self._emit_event("gift", {"user_name": user_name, "gift_name": gift_name, "gift_count": gift_cnt})
     
     def _parseLikeMsg(self, payload):
         '''点赞消息'''
         message = LikeMessage().parse(payload)
         user_name = message.user.nick_name
         count = message.count
-        print(f"【点赞msg】{user_name} 点了{count}个赞")
+        self.logger.debug("【点赞msg】%s 点了%s个赞", user_name, count)
+        self._emit_event("like", {"user_name": user_name, "count": count})
     
     def _parseMemberMsg(self, payload):
         '''进入直播间消息'''
@@ -373,27 +397,31 @@ class DouyinLiveWebFetcher:
         user_name = message.user.nick_name
         user_id = message.user.id
         gender = ["女", "男"][message.user.gender]
-        print(f"【进场msg】[{user_id}][{gender}]{user_name} 进入了直播间")
+        self.logger.debug("【进场msg】[%s][%s]%s 进入了直播间", user_id, gender, user_name)
+        self._emit_event("member_enter", {"user_id": user_id, "user_name": user_name, "gender": gender})
     
     def _parseSocialMsg(self, payload):
         '''关注消息'''
         message = SocialMessage().parse(payload)
         user_name = message.user.nick_name
         user_id = message.user.id
-        print(f"【关注msg】[{user_id}]{user_name} 关注了主播")
+        self.logger.debug("【关注msg】[%s]%s 关注了主播", user_id, user_name)
+        self._emit_event("follow", {"user_id": user_id, "user_name": user_name})
     
     def _parseRoomUserSeqMsg(self, payload):
         '''直播间统计'''
         message = RoomUserSeqMessage().parse(payload)
         current = message.total
         total = message.total_pv_for_anchor
-        print(f"【统计msg】当前观看人数: {current}, 累计观看人数: {total}")
+        self.logger.debug("【统计msg】当前观看人数: %s, 累计观看人数: %s", current, total)
+        self._emit_event("room_user_seq", {"current": current, "total": total})
     
     def _parseFansclubMsg(self, payload):
         '''粉丝团消息'''
         message = FansclubMessage().parse(payload)
         content = message.content
-        print(f"【粉丝团msg】 {content}")
+        self.logger.debug("【粉丝团msg】 %s", content)
+        self._emit_event("fansclub", {"content": content})
     
     def _parseEmojiChatMsg(self, payload):
         '''聊天表情包消息'''
@@ -402,33 +430,43 @@ class DouyinLiveWebFetcher:
         user = message.user
         common = message.common
         default_content = message.default_content
-        print(f"【聊天表情包id】 {emoji_id},user：{user},common:{common},default_content:{default_content}")
+        self.logger.debug("【聊天表情包id】 %s,user：%s,common:%s,default_content:%s", emoji_id, user, common, default_content)
+        self._emit_event("emoji_chat", {
+            "emoji_id": emoji_id,
+            "user": str(user),
+            "common": str(common),
+            "default_content": default_content,
+        })
     
     def _parseRoomMsg(self, payload):
         message = RoomMessage().parse(payload)
         common = message.common
         room_id = common.room_id
-        print(f"【直播间msg】直播间id:{room_id}")
+        self.logger.debug("【直播间msg】直播间id:%s", room_id)
+        self._emit_event("room", {"room_id": room_id})
     
     def _parseRoomStatsMsg(self, payload):
         message = RoomStatsMessage().parse(payload)
         display_long = message.display_long
-        print(f"【直播间统计msg】{display_long}")
+        self.logger.debug("【直播间统计msg】%s", display_long)
+        self._emit_event("room_stats", {"display_long": display_long})
     
     def _parseRankMsg(self, payload):
         message = RoomRankMessage().parse(payload)
         ranks_list = message.ranks_list
-        print(f"【直播间排行榜msg】{ranks_list}")
+        self.logger.debug("【直播间排行榜msg】%s", ranks_list)
+        self._emit_event("rank", {"ranks_list": ranks_list})
     
     def _parseControlMsg(self, payload):
         '''直播间状态消息'''
         message = ControlMessage().parse(payload)
-        
         if message.status == 3:
-            print("直播间已结束")
+            self.logger.info("直播间已结束")
             self.stop()
+        self._emit_event("control", {"status": message.status})
     
     def _parseRoomStreamAdaptationMsg(self, payload):
         message = RoomStreamAdaptationMessage().parse(payload)
         adaptationType = message.adaptation_type
-        print(f'直播间adaptation: {adaptationType}')
+        self.logger.debug("直播间adaptation: %s", adaptationType)
+        self._emit_event("room_stream_adaptation", {"adaptationType": adaptationType})
