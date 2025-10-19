@@ -6,6 +6,7 @@
 # @Author:      bubu
 # @Project:     douyinLiveWebFetcher
 
+import base64
 import codecs
 import gzip
 import hashlib
@@ -16,6 +17,7 @@ import string
 import subprocess
 import threading
 import time
+import json
 import execjs
 import urllib.parse
 from contextlib import contextmanager
@@ -215,18 +217,42 @@ class DouyinLiveWebFetcher:
     def _emit_event(self, event_type: str, payload: Any) -> None:
         if not self.event_sink:
             return
+        now = datetime.now(timezone.utc)
         event = {
             "event_type": event_type,
-            "payload": payload,
+            "payload": self._prepare_payload(payload),
             "live_id": self.live_id,
-            "received_at": datetime.now(timezone.utc).isoformat(),
+            "ts": int(now.timestamp() * 1000),
+            "received_at": now.isoformat(),
         }
         if self.streamer:
             event["streamer_id"] = self.streamer.get("id")
+            event["room_id"] = self.streamer.get("room_id") or self.streamer.get("live_id") or self.live_id
         try:
             self.event_sink(event)
         except Exception:
             self.logger.exception("Event sink failed | event_type=%s", event_type)
+
+    def _prepare_payload(self, payload: Any) -> Any:
+        if payload is None:
+            return None
+        if hasattr(payload, "to_json"):
+            try:
+                return json.loads(payload.to_json())
+            except Exception:
+                self.logger.exception("Failed to serialize message payload via to_json | type=%s", type(payload))
+                return {}
+        if isinstance(payload, (str, int, float, bool)):
+            return payload
+        if isinstance(payload, (bytes, bytearray)):
+            return base64.b64encode(payload).decode("utf-8")
+        if isinstance(payload, dict):
+            return {k: self._prepare_payload(v) for k, v in payload.items()}
+        if isinstance(payload, list):
+            return [self._prepare_payload(item) for item in payload]
+        if isinstance(payload, tuple):
+            return tuple(self._prepare_payload(item) for item in payload)
+        return str(payload)
     
     @property
     def ttwid(self):
@@ -527,7 +553,7 @@ class DouyinLiveWebFetcher:
         user_id = message.user.id
         content = message.content
         self.logger.info("Chat message | user_id=%s user_name=%s content=%s", user_id, user_name, content)
-        self._emit_event("chat", message.to_dict())
+        self._emit_event("chat", message)
     
     def _parseGiftMsg(self, payload):
         """礼物消息"""
@@ -536,7 +562,7 @@ class DouyinLiveWebFetcher:
         gift_name = message.gift.name
         gift_cnt = message.combo_count
         self.logger.info("Gift message | user_name=%s gift=%s count=%s", user_name, gift_name, gift_cnt)
-        self._emit_event("gift", message.to_dict())
+        self._emit_event("gift", message)
     
     def _parseLikeMsg(self, payload):
         '''点赞消息'''
@@ -544,16 +570,22 @@ class DouyinLiveWebFetcher:
         user_name = message.user.nick_name
         count = message.count
         self.logger.info("Like message | user_name=%s count=%s", user_name, count)
-        self._emit_event("like", message.to_dict())
+        self._emit_event("like", message)
     
     def _parseMemberMsg(self, payload):
         '''进入直播间消息'''
         message = MemberMessage().parse(payload)
         user_name = message.user.nick_name
         user_id = message.user.id
-        gender = ["女", "男"][message.user.gender]
+        gender_map = {
+            0: "未知",
+            1: "男",
+            2: "女",
+        }
+        gender_value = message.user.gender
+        gender = gender_map.get(gender_value, "未知")
         self.logger.info("Member join | user_id=%s user_name=%s gender=%s", user_id, user_name, gender)
-        self._emit_event("member", message.to_dict())
+        self._emit_event("member", message)
     
     def _parseSocialMsg(self, payload):
         '''关注消息'''
@@ -561,7 +593,7 @@ class DouyinLiveWebFetcher:
         user_name = message.user.nick_name
         user_id = message.user.id
         self.logger.info("Social follow | user_id=%s user_name=%s", user_id, user_name)
-        self._emit_event("social", message.to_dict())
+        self._emit_event("social", message)
     
     def _parseRoomUserSeqMsg(self, payload):
         '''直播间统计'''
@@ -569,14 +601,14 @@ class DouyinLiveWebFetcher:
         current = message.total
         total = message.total_pv_for_anchor
         self.logger.info("Room stats | current=%s total=%s", current, total)
-        self._emit_event("room_user_seq", message.to_dict())
+        self._emit_event("room_user_seq", message)
     
     def _parseFansclubMsg(self, payload):
         '''粉丝团消息'''
         message = FansclubMessage().parse(payload)
         content = message.content
         self.logger.info("Fansclub message | content=%s", content)
-        self._emit_event("fansclub", message.to_dict())
+        self._emit_event("fansclub", message)
     
     def _parseEmojiChatMsg(self, payload):
         '''聊天表情包消息'''
@@ -592,31 +624,31 @@ class DouyinLiveWebFetcher:
             common,
             default_content,
         )
-        self._emit_event("emoji_chat", message.to_dict())
+        self._emit_event("emoji_chat", message)
     
     def _parseRoomMsg(self, payload):
         message = RoomMessage().parse(payload)
         common = message.common
         room_id = common.room_id
         self.logger.info("Room info | room_id=%s", room_id)
-        self._emit_event("room_info", message.to_dict())
+        self._emit_event("room_info", message)
     
     def _parseRoomStatsMsg(self, payload):
         message = RoomStatsMessage().parse(payload)
         display_long = message.display_long
         self.logger.info("Room stats summary | display_long=%s", display_long)
-        self._emit_event("room_stats", message.to_dict())
+        self._emit_event("room_stats", message)
     
     def _parseRankMsg(self, payload):
         message = RoomRankMessage().parse(payload)
         ranks_list = message.ranks_list
         self.logger.info("Room rank | ranks_list=%s", ranks_list)
-        self._emit_event("room_rank", message.to_dict())
+        self._emit_event("room_rank", message)
     
     def _parseControlMsg(self, payload):
         '''直播间状态消息'''
         message = ControlMessage().parse(payload)
-        self._emit_event("control", message.to_dict())
+        self._emit_event("control", message)
         
         if message.status == 3:
             self.logger.warning("Room ended signal received")
@@ -626,4 +658,4 @@ class DouyinLiveWebFetcher:
         message = RoomStreamAdaptationMessage().parse(payload)
         adaptationType = message.adaptation_type
         self.logger.debug("Room stream adaptation | adaptation_type=%s", adaptationType)
-        self._emit_event("stream_adaptation", message.to_dict())
+        self._emit_event("stream_adaptation", message)

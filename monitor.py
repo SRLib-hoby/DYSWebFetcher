@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import threading
+import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional
@@ -12,8 +13,8 @@ from apscheduler.schedulers.blocking import BlockingScheduler
 
 from config import MonitorConfig
 from logging_config import get_logger
-from supabase_client import SupabaseService
 from liveMan import DouyinLiveWebFetcher
+from supabase_client import SupabaseService
 
 
 @dataclass
@@ -40,8 +41,8 @@ class StreamMonitor:
         )
         scheduler.add_job(
             self.check_streamers,
-            trigger="cron",
-            minute=self.config.cron_minute_expression,
+            trigger="interval",
+            minutes=self.config.monitor_interval_minutes,
             id="poll_streamers",
             max_instances=1,
             coalesce=True,
@@ -58,6 +59,7 @@ class StreamMonitor:
             self.logger.info("Shutdown signal received; stopping monitor.")
         finally:
             self._shutdown_fetchers()
+            self.supabase.close()
 
     def check_streamers(self) -> None:
         streamers = self.supabase.fetch_streamers()
@@ -146,18 +148,70 @@ class StreamMonitor:
                 self.logger.warning("Fetcher thread failed to exit cleanly | live_id=%s", state.fetcher.live_id)
 
     def _build_event_sink(self, streamer: Dict[str, Any]):
-        streamer_id = streamer.get("id")
         def sink(event: Dict[str, Any]) -> None:
+            live_identifier = event.get("live_id") or streamer.get("live_id") or streamer.get("room_id")
+            if not live_identifier:
+                self.logger.error("Dropping event without live_id | event_type=%s", event.get("event_type"))
+                return
+
+            payload = self._prepare_event_payload(event.get("payload"), streamer)
+            ts_value = self._coerce_event_timestamp(event)
+
+            room_identifier = event.get("room_id") or streamer.get("room_id") or streamer.get("live_id")
+
             record = {
-                "streamer_id": streamer_id,
-                "live_id": event.get("live_id"),
+                "live_id": str(live_identifier),
+                "room_id": str(room_identifier) if room_identifier is not None else None,
                 "event_type": event.get("event_type"),
-                "event_payload": event.get("payload"),
-                "received_at": event.get("received_at"),
-                "source_nickname": streamer.get("nickname"),
+                "event_payload": payload,
+                "ts": ts_value,
             }
             self.supabase.insert_event(record)
+
         return sink
+
+    def _prepare_event_payload(self, payload: Any, streamer: Dict[str, Any]) -> Any:
+        if payload is None:
+            enriched: Dict[str, Any] = {}
+        elif isinstance(payload, dict):
+            enriched = dict(payload)
+        else:
+            return payload
+
+        streamer_id = streamer.get("id")
+        if streamer_id is not None and "streamer_id" not in enriched:
+            enriched["streamer_id"] = str(streamer_id)
+
+        nickname = streamer.get("nickname")
+        if nickname and "source_nickname" not in enriched:
+            enriched["source_nickname"] = str(nickname)
+
+        return enriched
+
+    def _coerce_event_timestamp(self, event: Dict[str, Any]) -> int:
+        ts_value = event.get("ts")
+        if isinstance(ts_value, (int, float)):
+            return int(ts_value)
+        if isinstance(ts_value, str) and ts_value.strip().isdigit():
+            return int(ts_value.strip())
+
+        received_at = event.get("received_at")
+        if isinstance(received_at, str):
+            text = received_at.strip()
+            if text:
+                try:
+                    if text.endswith("Z"):
+                        text = text[:-1] + "+00:00"
+                    timestamp = datetime.fromisoformat(text)
+                    if timestamp.tzinfo is None:
+                        timestamp = timestamp.replace(tzinfo=timezone.utc)
+                    else:
+                        timestamp = timestamp.astimezone(timezone.utc)
+                    return int(timestamp.timestamp() * 1000)
+                except ValueError:
+                    self.logger.debug("Failed to parse received_at=%s; falling back to current time", received_at)
+
+        return int(time.time() * 1000)
 
     @staticmethod
     def _extract_live_id(streamer: Dict[str, Any]) -> Optional[str]:
@@ -174,7 +228,7 @@ def main() -> None:
     args = parser.parse_args()
 
     config = MonitorConfig.load(force_test_mode=args.test_interval)
-    supabase = SupabaseService(config.supabase_url, config.supabase_key)
+    supabase = SupabaseService(config)
     monitor = StreamMonitor(config, supabase)
     monitor.run()
 

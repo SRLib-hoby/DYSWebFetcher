@@ -4,17 +4,18 @@
 - `main.py`: thin wrapper that boots `monitor.main()` for service deployments.
 - `monitor.py`: APScheduler-driven orchestrator that polls Supabase, spins up crawlers, and enforces per-room cooldowns.
 - `liveMan.py`: crawler core handling tokens, anti-crawl pacing, WebSocket parsing, logging, and event emission.
-- `supabase_client.py`: minimal Supabase wrapper for reading `douyin_streamers` and inserting `douyin_events`.
-- `config.py`: centralizes env-driven settings (Supabase URL/key, monitor interval, anti-crawl delays, test toggle).
+- `supabase_client.py`: REST-based Supabase client with buffered writes into `douyin_events`.
+- `config.py`: loads `.env` settings (Supabase URL/key, schema/tables, monitor interval, anti-crawl delays, test toggle).
 - `logging_config.py`: configures process-wide colorful structured logging.
 - `protobuf/`: generated protocol buffers (`douyin.py`) plus schema (`douyin.proto`); regenerate whenever the schema changes.
 - JavaScript helpers (`sign.js`, `sign_v0.js`, `a_bogus.js`, `webmssdk.js`) contain reverse-engineered signing routines.
-- `requirements.txt`: authoritative dependency list; keep in sync when adding libraries (Supabase client, APScheduler, etc.).
+- `.env.example`: sample environment file; copy to `.env` and adjust secrets before running.
+- `requirements.txt`: authoritative dependency list; keep in sync when adding libraries (APScheduler, python-dotenv, etc.).
 
 ## Build, Test, and Development Commands
 - `python3 -m venv .venv && source .venv/bin/activate` (Windows: `.\.venv\Scripts\activate`) creates an isolated interpreter.
-- `pip install -r requirements.txt` installs requests, betterproto, websocket-client, ExecJS/MiniRacer, Supabase, and APScheduler.
-- Export `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY` (or `SUPABASE_ANON_KEY`) before launching the monitor.
+- `pip install -r requirements.txt` installs requests, betterproto, websocket-client, ExecJS/MiniRacer, APScheduler, and python-dotenv.
+- Copy `.env.example` to `.env`, then adjust `SUPABASE_URL`, `SUPABASE_KEY`, schema/table overrides, payload column (`SUPABASE_EVENT_PAYLOAD_COLUMN`, defaults to `payload`), and optional tuning knobs.
 - `python monitor.py` starts the hourly cron-like scheduler; add `--test-interval` to switch to 1-minute polling while QAing.
 - `python -m protobuf.douyin` (requires `protoc`) regenerates message classes after editing `douyin.proto`.
 - For single-room debugging, flag only one `douyin_streamers` row with `audit_realtime=true` and run `python monitor.py --test-interval`.
@@ -40,7 +41,7 @@
 
 ## Security & Configuration Tips
 - Never commit personal cookies, msToken values, Supabase keys, or private room identifiers.
-- Store Supabase secrets in environment variables or your platform’s secret manager; avoid checking in `.env` files.
+- Store Supabase secrets in environment variables or your platform’s secret manager; avoid checking in populated `.env` files.
 - Respect anti-crawl protections: keep randomized delays, jittered heartbeats, and cooldown windows intact or justify adjustments.
 - Refresh `a_bogus.js` and other helpers locally; note upstream signature changes in PR descriptions.
 - When deploying via cron/systemd, ensure only one monitor instance runs at a time (service-level lock or supervisor).
