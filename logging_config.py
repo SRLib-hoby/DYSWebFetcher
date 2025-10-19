@@ -1,0 +1,49 @@
+import logging
+import sys
+from typing import Optional
+
+LEVEL_COLORS = {
+    logging.DEBUG: "\033[36m",      # Cyan
+    logging.INFO: "\033[32m",       # Green
+    logging.WARNING: "\033[33m",    # Yellow
+    logging.ERROR: "\033[31m",      # Red
+    logging.CRITICAL: "\033[35m",   # Magenta
+}
+
+RESET_COLOR = "\033[0m"
+
+
+class ColorFormatter(logging.Formatter):
+    """Formatter that adds ANSI colors while keeping structured output."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        color = LEVEL_COLORS.get(record.levelno, "")
+        message = super().format(record)
+        if color:
+            message = f"{color}{message}{RESET_COLOR}"
+        return message
+
+
+def configure_logging(level: int = logging.INFO) -> logging.Logger:
+    """Configure application-wide logging once and return the root app logger."""
+    root_logger = logging.getLogger()
+    if not getattr(configure_logging, "_configured", False):
+        handler = logging.StreamHandler(sys.stdout)
+        formatter = ColorFormatter(
+            "%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        )
+        handler.setFormatter(formatter)
+        root_logger.handlers.clear()
+        root_logger.addHandler(handler)
+        root_logger.setLevel(level)
+        configure_logging._configured = True
+    return logging.getLogger("douyin")
+
+
+def get_logger(name: Optional[str] = None) -> logging.Logger:
+    """Retrieve a namespaced logger underneath the root 'douyin' logger."""
+    base_logger = configure_logging()
+    if name:
+        return base_logger.getChild(name)
+    return base_logger

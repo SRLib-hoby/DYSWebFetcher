@@ -9,6 +9,7 @@
 import codecs
 import gzip
 import hashlib
+import logging
 import random
 import re
 import string
@@ -18,16 +19,33 @@ import time
 import execjs
 import urllib.parse
 from contextlib import contextmanager
+from datetime import datetime, timezone
+from typing import Any, Callable, Dict, Optional
 from unittest.mock import patch
 
 import requests
 import websocket
 from py_mini_racer import MiniRacer
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+from urllib3.util.url import parse_url
 
 from ac_signature import get__ac_signature
+from config import MonitorConfig
+from logging_config import get_logger
 from protobuf.douyin import *
 
-from urllib3.util.url import parse_url
+USER_AGENT_POOL = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_6) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:129.0) Gecko/20100101 Firefox/129.0",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36",
+]
+
+logger = get_logger("liveMan")
 
 
 def execute_js(js_file: str):
@@ -80,8 +98,8 @@ def generateSignature(wss, script_file='sign.js'):
     try:
         signature = ctx.call("get_sign", md5_param)
         return signature
-    except Exception as e:
-        print(e)
+    except Exception:
+        logger.exception("Failed to generate signature using MiniRacer")
     
     # 以下代码对应js脚本为sign_v0.js
     # context = execjs.compile(script)
@@ -106,29 +124,109 @@ def generateMsToken(length=182):
 
 class DouyinLiveWebFetcher:
     
-    def __init__(self, live_id, abogus_file='a_bogus.js'):
+    def __init__(
+        self,
+        live_id: str,
+        *,
+        abogus_file: str = 'a_bogus.js',
+        streamer: Optional[Dict[str, Any]] = None,
+        config: Optional[MonitorConfig] = None,
+        event_sink: Optional[Callable[[Dict[str, Any]], None]] = None,
+        stop_callback: Optional[Callable[[str], None]] = None,
+    ):
         """
         直播间弹幕抓取对象
         :param live_id: 直播间的直播id，打开直播间web首页的链接如：https://live.douyin.com/261378947940，
                         其中的261378947940即是live_id
         """
+        self.logger = logger.getChild(self.__class__.__name__)
         self.abogus_file = abogus_file
-        self.__ttwid = None
-        self.__room_id = None
+        self.streamer = streamer or {}
+        self.config = config
+        self.event_sink = event_sink
+        self.stop_callback = stop_callback
+        self.live_id = str(live_id)
+        self.__ttwid: Optional[str] = None
+        self.__room_id: Optional[str] = None
+        self._stop_event = threading.Event()
+        self._shutdown_notified = False
+        self._heartbeats_thread: Optional[threading.Thread] = None
+        self._room_status_cache: Optional[Dict[str, Any]] = None
         self.session = requests.Session()
-        self.live_id = live_id
+        self._configure_session()
         self.host = "https://www.douyin.com/"
         self.live_url = "https://live.douyin.com/"
-        self.user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36 Edg/140.0.0.0"
+        self.user_agent = random.choice(USER_AGENT_POOL)
         self.headers = {
             'User-Agent': self.user_agent
         }
+        self.session.headers.update(self.headers)
+        self._delay_range = (
+            (self.config.anti_crawl_min_delay, self.config.anti_crawl_max_delay)
+            if self.config
+            else (1.5, 4.0)
+        )
+
+    def _configure_session(self) -> None:
+        retry = Retry(
+            total=3,
+            read=3,
+            connect=3,
+            backoff_factor=0.6,
+            status_forcelist=[429, 500, 502, 503, 504],
+            allowed_methods=["GET"],
+        )
+        adapter = HTTPAdapter(max_retries=retry, pool_connections=5, pool_maxsize=5)
+        self.session.mount("https://", adapter)
+        self.session.mount("http://", adapter)
     
     def start(self):
+        self._stop_event.clear()
+        self._shutdown_notified = False
+        delay = random.uniform(*self._delay_range)
+        self.logger.debug("Anti-crawl delay before websocket connect | delay=%.2fs", delay)
+        time.sleep(delay)
         self._connectWebSocket()
     
-    def stop(self):
-        self.ws.close()
+    def stop(self, reason: str = "manual_stop"):
+        if self._stop_event.is_set():
+            return
+        self._stop_event.set()
+        try:
+            if hasattr(self, "ws") and self.ws:
+                self.ws.close()
+        except Exception:
+            self.logger.exception("Error closing websocket connection")
+        finally:
+            self._notify_stopped(reason=reason)
+
+    def _notify_stopped(self, reason: str) -> None:
+        if self._shutdown_notified:
+            return
+        self._shutdown_notified = True
+        if self.stop_callback:
+            try:
+                self.stop_callback(self.live_id, reason=reason)
+            except TypeError:
+                self.stop_callback(self.live_id)
+            except Exception:
+                self.logger.exception("Stop callback raised an exception")
+
+    def _emit_event(self, event_type: str, payload: Any) -> None:
+        if not self.event_sink:
+            return
+        event = {
+            "event_type": event_type,
+            "payload": payload,
+            "live_id": self.live_id,
+            "received_at": datetime.now(timezone.utc).isoformat(),
+        }
+        if self.streamer:
+            event["streamer_id"] = self.streamer.get("id")
+        try:
+            self.event_sink(event)
+        except Exception:
+            self.logger.exception("Event sink failed | event_type=%s", event_type)
     
     @property
     def ttwid(self):
@@ -145,7 +243,7 @@ class DouyinLiveWebFetcher:
             response = self.session.get(self.live_url, headers=headers)
             response.raise_for_status()
         except Exception as err:
-            print("【X】Request the live url error: ", err)
+            self.logger.error("Request live url error | err=%s", err)
         else:
             self.__ttwid = response.cookies.get('ttwid')
             return self.__ttwid
@@ -167,12 +265,12 @@ class DouyinLiveWebFetcher:
             response = self.session.get(url, headers=headers)
             response.raise_for_status()
         except Exception as err:
-            print("【X】Request the live room url error: ", err)
+            self.logger.error("Request live room url error | err=%s", err)
         else:
             match = re.search(r'roomId\\":\\"(\d+)\\"', response.text)
             if match is None or len(match.groups()) < 1:
-                print("【X】No match found for roomId")
-            
+                self.logger.warning("No match found for roomId | live_id=%s", self.live_id)
+                return None
             self.__room_id = match.group(1)
             
             return self.__room_id
@@ -181,13 +279,20 @@ class DouyinLiveWebFetcher:
         """
         获取 __ac_nonce
         """
-        resp_cookies = self.session.get(self.host, headers=self.headers).cookies
-        return resp_cookies.get("__ac_nonce")
+        try:
+            response = self.session.get(self.host, headers=self.headers, timeout=10)
+            response.raise_for_status()
+        except Exception as err:
+            self.logger.error("Failed to fetch __ac_nonce | err=%s", err)
+            return None
+        return response.cookies.get("__ac_nonce")
     
     def get_ac_signature(self, __ac_nonce: str = None) -> str:
         """
         获取 __ac_signature
         """
+        if not __ac_nonce:
+            self.logger.warning("__ac_nonce missing while generating signature | live_id=%s", self.live_id)
         __ac_signature = get__ac_signature(self.host[8:], __ac_nonce, self.user_agent)
         self.session.cookies.set("__ac_signature", __ac_signature)
         return __ac_signature
@@ -197,8 +302,12 @@ class DouyinLiveWebFetcher:
         获取 a_bogus
         """
         url = urllib.parse.urlencode(url_params)
-        ctx = execute_js(self.abogus_file)
-        _a_bogus = ctx.call("get_ab", url, self.user_agent)
+        try:
+            ctx = execute_js(self.abogus_file)
+            _a_bogus = ctx.call("get_ab", url, self.user_agent)
+        except Exception as err:
+            self.logger.exception("Failed to generate a_bogus | err=%s", err)
+            raise
         return _a_bogus
     
     def get_room_status(self):
@@ -210,12 +319,16 @@ class DouyinLiveWebFetcher:
         msToken = generateMsToken()
         nonce = self.get_ac_nonce()
         signature = self.get_ac_signature(nonce)
+        current_room_id = self.room_id
+        if not current_room_id:
+            self.logger.warning("Unable to resolve room_id for status check | live_id=%s", self.live_id)
+            return None
         url = ('https://live.douyin.com/webcast/room/web/enter/?aid=6383'
                '&app_name=douyin_web&live_id=1&device_platform=web&language=zh-CN&enter_from=page_refresh'
                '&cookie_enabled=true&screen_width=5120&screen_height=1440&browser_language=zh-CN&browser_platform=Win32'
                '&browser_name=Edge&browser_version=140.0.0.0'
                f'&web_rid={self.live_id}'
-               f'&room_id_str={self.room_id}'
+               f'&room_id_str={current_room_id}'
                '&enter_source=&is_need_double_stream=false&insert_task_id=&live_reason=&msToken=' + msToken)
         query = parse_url(url).query
         params = {i[0]: i[1] for i in [j.split('=') for j in query.split('&')]}
@@ -226,34 +339,77 @@ class DouyinLiveWebFetcher:
             'Referer': f'https://live.douyin.com/{self.live_id}',
             'Cookie': f'ttwid={self.ttwid};__ac_nonce={nonce}; __ac_signature={signature}',
         })
-        resp = self.session.get(url, headers=headers)
-        data = resp.json().get('data')
-        if data:
-            room_status = data.get('room_status')
-            user = data.get('user')
-            user_id = user.get('id_str')
-            nickname = user.get('nickname')
-            print(f"【{nickname}】[{user_id}]直播间：{['正在直播', '已结束'][bool(room_status)]}.")
+        try:
+            resp = self.session.get(url, headers=headers, timeout=10)
+            resp.raise_for_status()
+            payload = resp.json()
+        except Exception as err:
+            self.logger.error("Failed to fetch room status | live_id=%s err=%s", self.live_id, err)
+            return None
+
+        data = (payload or {}).get('data')
+        if not data:
+            self.logger.debug("Room status response missing data | live_id=%s", self.live_id)
+            return None
+
+        room_status = data.get('room_status')
+        user = data.get('user') or {}
+        user_id = user.get('id_str')
+        nickname = user.get('nickname')
+        status_label = ['正在直播', '已结束'][bool(room_status)]
+
+        result = {
+            "room_status": room_status,
+            "user_id": user_id,
+            "nickname": nickname,
+            "raw": data,
+        }
+        self._room_status_cache = result
+        self.logger.info(
+            "Room status | nickname=%s user_id=%s status=%s",
+            nickname,
+            user_id,
+            status_label,
+        )
+        self._emit_event("room_status", result)
+        return result
+
+    def is_streaming(self) -> bool:
+        status = self.get_room_status()
+        if not status:
+            return False
+        return status.get("room_status") == 0
     
     def _connectWebSocket(self):
         """
         连接抖音直播间websocket服务器，请求直播间数据
         """
+        if self._stop_event.is_set():
+            self.logger.debug("Stop event set before websocket connect; aborting connect.")
+            return
+        room_id = self.room_id
+        if not room_id:
+            self.logger.error("Cannot start websocket without room_id | live_id=%s", self.live_id)
+            self._notify_stopped(reason="missing_room_id")
+            return
+
+        user_unique_id = ''.join(random.choice(string.digits) for _ in range(18))
+
         wss = ("wss://webcast100-ws-web-lq.douyin.com/webcast/im/push/v2/?app_name=douyin_web"
                "&version_code=180800&webcast_sdk_version=1.0.14-beta.0"
                "&update_version_code=1.0.14-beta.0&compress=gzip&device_platform=web&cookie_enabled=true"
                "&screen_width=1536&screen_height=864&browser_language=zh-CN&browser_platform=Win32"
                "&browser_name=Mozilla"
-               "&browser_version=5.0%20(Windows%20NT%2010.0;%20Win64;%20x64)%20AppleWebKit/537.36%20(KHTML,"
+                "&browser_version=5.0%20(Windows%20NT%2010.0;%20Win64;%20x64)%20AppleWebKit/537.36%20(KHTML,"
                "%20like%20Gecko)%20Chrome/126.0.0.0%20Safari/537.36"
                "&browser_online=true&tz_name=Asia/Shanghai"
                "&cursor=d-1_u-1_fh-7392091211001140287_t-1721106114633_r-1"
-               f"&internal_ext=internal_src:dim|wss_push_room_id:{self.room_id}|wss_push_did:7319483754668557238"
+               f"&internal_ext=internal_src:dim|wss_push_room_id:{room_id}|wss_push_did:{user_unique_id}"
                f"|first_req_ms:1721106114541|fetch_time:1721106114633|seq:1|wss_info:0-1721106114633-0-0|"
                f"wrds_v:7392094459690748497"
                f"&host=https://live.douyin.com&aid=6383&live_id=1&did_rule=3&endpoint=live_pc&support_wrds=1"
-               f"&user_unique_id=7319483754668557238&im_path=/webcast/im/fetch/&identity=audience"
-               f"&need_persist_msg_count=15&insert_task_id=&live_reason=&room_id={self.room_id}&heartbeatDuration=0")
+               f"&user_unique_id={user_unique_id}&im_path=/webcast/im/fetch/&identity=audience"
+               f"&need_persist_msg_count=15&insert_task_id=&live_reason=&room_id={room_id}&heartbeatDuration=0")
         
         signature = generateSignature(wss)
         wss += f"&signature={signature}"
@@ -269,32 +425,40 @@ class DouyinLiveWebFetcher:
                                          on_error=self._wsOnError,
                                          on_close=self._wsOnClose)
         try:
-            self.ws.run_forever()
-        except Exception:
-            self.stop()
+            self._emit_event("connection_attempt", {"live_id": self.live_id})
+            self.ws.run_forever(ping_interval=0, skip_utf8_validation=True)
+        except Exception as err:
+            self.logger.exception("WebSocket run_forever error | live_id=%s err=%s", self.live_id, err)
+            self._notify_stopped(reason="ws_exception")
             raise
     
     def _sendHeartbeat(self):
         """
         发送心跳包
         """
-        while True:
+        while not self._stop_event.is_set():
             try:
                 heartbeat = PushFrame(payload_type='hb').SerializeToString()
-                self.ws.send(heartbeat, websocket.ABNF.OPCODE_PING)
-                print("【√】发送心跳包")
+                if self.ws:
+                    self.ws.send(heartbeat, websocket.ABNF.OPCODE_PING)
+                self.logger.debug("Heartbeat sent")
             except Exception as e:
-                print("【X】心跳包检测错误: ", e)
+                self.logger.error("Heartbeat error | err=%s", e)
+                self._notify_stopped(reason="heartbeat_error")
                 break
             else:
-                time.sleep(5)
+                wait_seconds = 5 + random.uniform(0.5, 1.5)
+                self._stop_event.wait(wait_seconds)
     
     def _wsOnOpen(self, ws):
         """
         连接建立成功
         """
-        print("【√】WebSocket连接成功.")
-        threading.Thread(target=self._sendHeartbeat).start()
+        self.logger.info("WebSocket connection established")
+        self._emit_event("connection_open", {"live_id": self.live_id})
+        if not self._heartbeats_thread or not self._heartbeats_thread.is_alive():
+            self._heartbeats_thread = threading.Thread(target=self._sendHeartbeat, daemon=True)
+            self._heartbeats_thread.start()
     
     def _wsOnMessage(self, ws, message):
         """
@@ -316,33 +480,45 @@ class DouyinLiveWebFetcher:
             ws.send(ack, websocket.ABNF.OPCODE_BINARY)
         
         # 根据消息类别解析消息体
+        handlers = {
+            'WebcastChatMessage': self._parseChatMsg,  # 聊天消息
+            'WebcastGiftMessage': self._parseGiftMsg,  # 礼物消息
+            'WebcastLikeMessage': self._parseLikeMsg,  # 点赞消息
+            'WebcastMemberMessage': self._parseMemberMsg,  # 进入直播间消息
+            'WebcastSocialMessage': self._parseSocialMsg,  # 关注消息
+            'WebcastRoomUserSeqMessage': self._parseRoomUserSeqMsg,  # 直播间统计
+            'WebcastFansclubMessage': self._parseFansclubMsg,  # 粉丝团消息
+            'WebcastControlMessage': self._parseControlMsg,  # 直播间状态消息
+            'WebcastEmojiChatMessage': self._parseEmojiChatMsg,  # 聊天表情包消息
+            'WebcastRoomStatsMessage': self._parseRoomStatsMsg,  # 直播间统计信息
+            'WebcastRoomMessage': self._parseRoomMsg,  # 直播间信息
+            'WebcastRoomRankMessage': self._parseRankMsg,  # 直播间排行榜信息
+            'WebcastRoomStreamAdaptationMessage': self._parseRoomStreamAdaptationMsg,  # 直播间流配置
+        }
+
         for msg in response.messages_list:
             method = msg.method
+            handler = handlers.get(method)
+            if not handler:
+                self.logger.debug("Unhandled message method | method=%s", method)
+                continue
             try:
-                {
-                    'WebcastChatMessage': self._parseChatMsg,  # 聊天消息
-                    'WebcastGiftMessage': self._parseGiftMsg,  # 礼物消息
-                    'WebcastLikeMessage': self._parseLikeMsg,  # 点赞消息
-                    'WebcastMemberMessage': self._parseMemberMsg,  # 进入直播间消息
-                    'WebcastSocialMessage': self._parseSocialMsg,  # 关注消息
-                    'WebcastRoomUserSeqMessage': self._parseRoomUserSeqMsg,  # 直播间统计
-                    'WebcastFansclubMessage': self._parseFansclubMsg,  # 粉丝团消息
-                    'WebcastControlMessage': self._parseControlMsg,  # 直播间状态消息
-                    'WebcastEmojiChatMessage': self._parseEmojiChatMsg,  # 聊天表情包消息
-                    'WebcastRoomStatsMessage': self._parseRoomStatsMsg,  # 直播间统计信息
-                    'WebcastRoomMessage': self._parseRoomMsg,  # 直播间信息
-                    'WebcastRoomRankMessage': self._parseRankMsg,  # 直播间排行榜信息
-                    'WebcastRoomStreamAdaptationMessage': self._parseRoomStreamAdaptationMsg,  # 直播间流配置
-                }.get(method)(msg.payload)
+                handler(msg.payload)
             except Exception:
-                pass
+                self.logger.exception("Failed to handle message | method=%s", method)
     
     def _wsOnError(self, ws, error):
-        print("WebSocket error: ", error)
+        self.logger.error("WebSocket error | err=%s", error)
+        self._emit_event("connection_error", {"live_id": self.live_id, "error": str(error)})
     
     def _wsOnClose(self, ws, *args):
+        self.logger.info("WebSocket connection closed | args=%s", args)
+        self._emit_event("connection_closed", {"live_id": self.live_id, "args": args})
+        self._stop_event.set()
+        if self._heartbeats_thread and self._heartbeats_thread.is_alive():
+            self._heartbeats_thread.join(timeout=5)
         self.get_room_status()
-        print("WebSocket connection closed.")
+        self._notify_stopped(reason="ws_closed")
     
     def _parseChatMsg(self, payload):
         """聊天消息"""
@@ -350,7 +526,8 @@ class DouyinLiveWebFetcher:
         user_name = message.user.nick_name
         user_id = message.user.id
         content = message.content
-        print(f"【聊天msg】[{user_id}]{user_name}: {content}")
+        self.logger.info("Chat message | user_id=%s user_name=%s content=%s", user_id, user_name, content)
+        self._emit_event("chat", message.to_dict())
     
     def _parseGiftMsg(self, payload):
         """礼物消息"""
@@ -358,14 +535,16 @@ class DouyinLiveWebFetcher:
         user_name = message.user.nick_name
         gift_name = message.gift.name
         gift_cnt = message.combo_count
-        print(f"【礼物msg】{user_name} 送出了 {gift_name}x{gift_cnt}")
+        self.logger.info("Gift message | user_name=%s gift=%s count=%s", user_name, gift_name, gift_cnt)
+        self._emit_event("gift", message.to_dict())
     
     def _parseLikeMsg(self, payload):
         '''点赞消息'''
         message = LikeMessage().parse(payload)
         user_name = message.user.nick_name
         count = message.count
-        print(f"【点赞msg】{user_name} 点了{count}个赞")
+        self.logger.info("Like message | user_name=%s count=%s", user_name, count)
+        self._emit_event("like", message.to_dict())
     
     def _parseMemberMsg(self, payload):
         '''进入直播间消息'''
@@ -373,27 +552,31 @@ class DouyinLiveWebFetcher:
         user_name = message.user.nick_name
         user_id = message.user.id
         gender = ["女", "男"][message.user.gender]
-        print(f"【进场msg】[{user_id}][{gender}]{user_name} 进入了直播间")
+        self.logger.info("Member join | user_id=%s user_name=%s gender=%s", user_id, user_name, gender)
+        self._emit_event("member", message.to_dict())
     
     def _parseSocialMsg(self, payload):
         '''关注消息'''
         message = SocialMessage().parse(payload)
         user_name = message.user.nick_name
         user_id = message.user.id
-        print(f"【关注msg】[{user_id}]{user_name} 关注了主播")
+        self.logger.info("Social follow | user_id=%s user_name=%s", user_id, user_name)
+        self._emit_event("social", message.to_dict())
     
     def _parseRoomUserSeqMsg(self, payload):
         '''直播间统计'''
         message = RoomUserSeqMessage().parse(payload)
         current = message.total
         total = message.total_pv_for_anchor
-        print(f"【统计msg】当前观看人数: {current}, 累计观看人数: {total}")
+        self.logger.info("Room stats | current=%s total=%s", current, total)
+        self._emit_event("room_user_seq", message.to_dict())
     
     def _parseFansclubMsg(self, payload):
         '''粉丝团消息'''
         message = FansclubMessage().parse(payload)
         content = message.content
-        print(f"【粉丝团msg】 {content}")
+        self.logger.info("Fansclub message | content=%s", content)
+        self._emit_event("fansclub", message.to_dict())
     
     def _parseEmojiChatMsg(self, payload):
         '''聊天表情包消息'''
@@ -402,33 +585,45 @@ class DouyinLiveWebFetcher:
         user = message.user
         common = message.common
         default_content = message.default_content
-        print(f"【聊天表情包id】 {emoji_id},user：{user},common:{common},default_content:{default_content}")
+        self.logger.info(
+            "Emoji chat | emoji_id=%s user=%s common=%s default_content=%s",
+            emoji_id,
+            user,
+            common,
+            default_content,
+        )
+        self._emit_event("emoji_chat", message.to_dict())
     
     def _parseRoomMsg(self, payload):
         message = RoomMessage().parse(payload)
         common = message.common
         room_id = common.room_id
-        print(f"【直播间msg】直播间id:{room_id}")
+        self.logger.info("Room info | room_id=%s", room_id)
+        self._emit_event("room_info", message.to_dict())
     
     def _parseRoomStatsMsg(self, payload):
         message = RoomStatsMessage().parse(payload)
         display_long = message.display_long
-        print(f"【直播间统计msg】{display_long}")
+        self.logger.info("Room stats summary | display_long=%s", display_long)
+        self._emit_event("room_stats", message.to_dict())
     
     def _parseRankMsg(self, payload):
         message = RoomRankMessage().parse(payload)
         ranks_list = message.ranks_list
-        print(f"【直播间排行榜msg】{ranks_list}")
+        self.logger.info("Room rank | ranks_list=%s", ranks_list)
+        self._emit_event("room_rank", message.to_dict())
     
     def _parseControlMsg(self, payload):
         '''直播间状态消息'''
         message = ControlMessage().parse(payload)
+        self._emit_event("control", message.to_dict())
         
         if message.status == 3:
-            print("直播间已结束")
-            self.stop()
+            self.logger.warning("Room ended signal received")
+            self.stop(reason="room_ended")
     
     def _parseRoomStreamAdaptationMsg(self, payload):
         message = RoomStreamAdaptationMessage().parse(payload)
         adaptationType = message.adaptation_type
-        print(f'直播间adaptation: {adaptationType}')
+        self.logger.debug("Room stream adaptation | adaptation_type=%s", adaptationType)
+        self._emit_event("stream_adaptation", message.to_dict())

@@ -6,10 +6,8 @@
 # @Author:      bubu
 # @Project:     douyinLiveWebFetcher
 
-from liveMan import DouyinLiveWebFetcher
+from monitor import main as run_monitor
+
 
 if __name__ == '__main__':
-    live_id = '510200350291'
-    room = DouyinLiveWebFetcher(live_id)
-    # room.get_room_status() # 失效
-    room.start()
+    run_monitor()
