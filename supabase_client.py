@@ -591,26 +591,37 @@ class SupabaseService:
         if not isinstance(user, dict):
             return None
         summary = {
-            "id": self._stringify_id(
-                self._get_field(user, "id", "id_str")
-            ),
-            "sec_uid": self._get_field(user, "sec_uid"),
-            "display_id": self._get_field(user, "display_id"),
-            "short_id": self._stringify_id(self._get_field(user, "short_id")),
+            "id": self._stringify_id(self._get_field(user, "id", "id_str")),
+            # "sec_uid": self._get_field(user, "sec_uid"),
+            "gender": self._get_field(user, "gender"),
             "nickname": self._get_field(user, "nick_name", "nickname"),
+            "display_id": self._get_field(user, "display_id", "displayId"),
+            "short_id": self._stringify_id(self._get_field(user, "short_id")),
         }
+        if summary.get("display_id") and "displayId" not in summary:
+            summary["displayId"] = summary["display_id"]
         pay_grade = self._get_field(user, "pay_grade")
         if isinstance(pay_grade, dict):
             level = self._get_field(pay_grade, "level")
             if level is not None:
                 summary["level"] = level
+                summary["pay_grade_level"] = level
         fans_club = self._get_field(user, "fans_club")
         if isinstance(fans_club, dict):
             data = self._get_field(fans_club, "data")
             if isinstance(data, dict):
-                level = self._get_field(data, "level")
-                if level is not None:
-                    summary["fans_club_level"] = level
+                club_level = self._get_field(data, "level")
+                if club_level is not None:
+                    summary["fans_club_level"] = club_level
+                club_status = self._get_field(data, "user_fans_club_status")
+                if club_status is not None:
+                    summary["fans_club_status"] = club_status
+            club_status_root = self._get_field(fans_club, "user_fans_club_status")
+            if club_status_root is not None and "fans_club_status" not in summary:
+                summary["fans_club_status"] = club_status_root
+            club_level_root = self._get_field(fans_club, "level")
+            if club_level_root is not None and "fans_club_level" not in summary:
+                summary["fans_club_level"] = club_level_root
         return self._compact_dict(summary)
 
     def _extract_text_value(self, text_payload: Any) -> str | None:
