@@ -8,4 +8,8 @@ package-lock.json
 .DS_Store
 *.pyc
 .env
+!.env.example
 .pytest_cache
+
+logs/
+build/
