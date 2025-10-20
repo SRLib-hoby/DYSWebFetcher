@@ -7,7 +7,9 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional
 
-from apscheduler.executors.pool import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+from apscheduler.executors.pool import ThreadPoolExecutor as APSchedulerThreadPoolExecutor
 from apscheduler.jobstores.memory import MemoryJobStore
 from apscheduler.schedulers.blocking import BlockingScheduler
 
@@ -36,7 +38,7 @@ class StreamMonitor:
     def run(self) -> None:
         scheduler = BlockingScheduler(
             jobstores={"default": MemoryJobStore()},
-            executors={"default": ThreadPoolExecutor(max_workers=1)},
+            executors={"default": APSchedulerThreadPoolExecutor(max_workers=1)},
             timezone=timezone.utc,
         )
         scheduler.add_job(
@@ -68,44 +70,71 @@ class StreamMonitor:
             self.logger.info("No audit_realtime streamers found during check.")
             return
 
-        for streamer in streamers:
-            live_id = self._extract_live_id(streamer)
-            if not live_id:
-                continue
+        with ThreadPoolExecutor(max_workers=len(streamers)) as executor:
+            futures = [
+                executor.submit(self._evaluate_streamer, streamer, now)
+                for streamer in streamers
+            ]
 
-            with self._lock:
-                if live_id in self._active_fetchers:
-                    self.logger.debug("Streamer already active | live_id=%s", live_id)
-                    continue
-                cooldown_until = self._cooldowns.get(live_id)
+            for future in as_completed(futures):
+                try:
+                    future.result()
+                except Exception:
+                    self.logger.exception("Streamer evaluation task failed")
 
-            if cooldown_until and cooldown_until > now:
-                self.logger.debug(
-                    "Skipping live_id=%s still in cooldown until %s",
-                    live_id,
-                    cooldown_until.isoformat(),
-                )
-                continue
+    def _evaluate_streamer(self, streamer: Dict[str, Any], now: datetime) -> None:
+        live_id = self._extract_live_id(streamer)
+        if not live_id:
+            return
 
-            fetcher = DouyinLiveWebFetcher(
-                live_id=live_id,
-                streamer=streamer,
-                config=self.config,
-                event_sink=self._build_event_sink(streamer),
-                stop_callback=self._on_fetcher_stopped,
+        with self._lock:
+            if live_id in self._active_fetchers:
+                self.logger.debug("Streamer already active | live_id=%s", live_id)
+                return
+            cooldown_until = self._cooldowns.get(live_id)
+
+        if cooldown_until and cooldown_until > now:
+            self.logger.debug(
+                "Skipping live_id=%s still in cooldown until %s",
+                live_id,
+                cooldown_until.isoformat(),
             )
+            return
 
-            if not fetcher.is_streaming():
-                self.logger.info("Streamer offline | live_id=%s streamer_id=%s", live_id, streamer.get("id"))
-                with self._lock:
-                    self._cooldowns[live_id] = now + timedelta(minutes=self.config.monitor_interval_minutes)
-                continue
+        fetcher = DouyinLiveWebFetcher(
+            live_id=live_id,
+            streamer=streamer,
+            config=self.config,
+            event_sink=self._build_event_sink(streamer),
+            stop_callback=self._on_fetcher_stopped,
+        )
 
-            thread = threading.Thread(target=self._run_fetcher, args=(fetcher,), daemon=True)
+        try:
+            is_streaming = fetcher.is_streaming()
+        except Exception:
+            self.logger.exception("Failed to evaluate stream status | live_id=%s", live_id)
+            return
+
+        if not is_streaming:
+            self.logger.info("Streamer offline | live_id=%s streamer_id=%s", live_id, streamer.get("id"))
             with self._lock:
-                self._active_fetchers[live_id] = FetcherState(fetcher=fetcher, thread=thread, streamer=streamer)
-            thread.start()
-            self.logger.info("Started monitoring | live_id=%s streamer_id=%s", live_id, streamer.get("id"))
+                self._cooldowns[live_id] = now + timedelta(minutes=self.config.monitor_interval_minutes)
+            return
+
+        thread = threading.Thread(target=self._run_fetcher, args=(fetcher,), daemon=True)
+
+        with self._lock:
+            if live_id in self._active_fetchers:
+                self.logger.debug(
+                    "Streamer became active while evaluating | live_id=%s streamer_id=%s",
+                    live_id,
+                    streamer.get("id"),
+                )
+                return
+            self._active_fetchers[live_id] = FetcherState(fetcher=fetcher, thread=thread, streamer=streamer)
+
+        thread.start()
+        self.logger.info("Started monitoring | live_id=%s streamer_id=%s", live_id, streamer.get("id"))
 
     def _run_fetcher(self, fetcher: DouyinLiveWebFetcher) -> None:
         try:

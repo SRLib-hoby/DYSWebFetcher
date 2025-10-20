@@ -1,7 +1,8 @@
+import json
 import logging
 import os
 import sys
-from typing import Optional
+from typing import Any, Dict, Iterable, Optional
 
 from dotenv import load_dotenv
 
@@ -20,11 +21,93 @@ class ColorFormatter(logging.Formatter):
     """Formatter that adds ANSI colors while keeping structured output."""
 
     def format(self, record: logging.LogRecord) -> str:
+        summary = None
+        message = record.getMessage()
+        parsed = self._try_parse_json(message)
+        if parsed is not None:
+            summary = self._summarize_json(parsed)
+
         color = LEVEL_COLORS.get(record.levelno, "")
-        message = super().format(record)
+        formatted = super().format(record)
+        if summary:
+            formatted = f"{formatted}\n    summary: {summary}"
         if color:
-            message = f"{color}{message}{RESET_COLOR}"
-        return message
+            formatted = f"{color}{formatted}{RESET_COLOR}"
+        return formatted
+
+    @staticmethod
+    def _try_parse_json(message: Any) -> Optional[Any]:
+        if not isinstance(message, str):
+            return None
+        text = message.strip()
+        if not text or text[0] not in ("{", "["):
+            return None
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            return None
+
+    @staticmethod
+    def _summarize_json(data: Any) -> str:
+        if isinstance(data, list):
+            if not data:
+                return "[]"
+            if all(isinstance(item, dict) for item in data):
+                return f"array[{len(data)}] first={ColorFormatter._summarize_dict(data[0])}"
+            return f"array[{len(data)}] sample={ColorFormatter._shorten_value(data[0])}"
+        if isinstance(data, dict):
+            return ColorFormatter._summarize_dict(data)
+        return ColorFormatter._shorten_value(data)
+
+    @staticmethod
+    def _summarize_dict(item: Dict[str, Any]) -> str:
+        prioritized_keys: Iterable[str] = (
+            "event_type",
+            "status",
+            "code",
+            "message",
+            "live_id",
+            "room_id",
+            "room_status",
+            "anchor_name",
+            "ts",
+        )
+        parts = []
+        for key in prioritized_keys:
+            if key in item:
+                parts.append(f"{key}={ColorFormatter._shorten_value(item[key])}")
+        payload = item.get("payload") or item.get("event_payload")
+        if isinstance(payload, dict):
+            payload_keys = ("type", "user_id", "nickname", "gift_name", "value", "count")
+            payload_parts = [
+                f"{key}={ColorFormatter._shorten_value(payload[key])}"
+                for key in payload_keys
+                if key in payload
+            ]
+            if payload_parts:
+                parts.append(f"payload[{', '.join(payload_parts)}]")
+        if not parts:
+            for key, value in item.items():
+                if isinstance(value, (str, int, float, bool)) or value is None:
+                    parts.append(f"{key}={ColorFormatter._shorten_value(value)}")
+                elif isinstance(value, dict) and value:
+                    parts.append(f"{key}={{...}}")
+                elif isinstance(value, list) and value:
+                    parts.append(f"{key}=[{len(value)}]")
+                if len(parts) >= 4:
+                    break
+        return ", ".join(parts) if parts else "{}"
+
+    @staticmethod
+    def _shorten_value(value: Any) -> str:
+        if value is None:
+            return "null"
+        if isinstance(value, bool):
+            return "true" if value else "false"
+        text = str(value)
+        if len(text) > 60:
+            return f"{text[:57]}..."
+        return text
 
 
 def _resolve_log_level(default: int) -> int:
